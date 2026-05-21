@@ -14,7 +14,7 @@ import argparse
 import json
 import random
 import re
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -69,6 +69,7 @@ POSITIVE_OR_EVALUATIVE_PATTERNS = [
     "缓解",
     "效果",
     "便利",
+    "方便",
     "推荐",
     "满意",
     "认可",
@@ -78,6 +79,18 @@ POSITIVE_OR_EVALUATIVE_PATTERNS = [
     "促销活动时才购买",
     "疗效好",
 ]
+
+QUESTION_PRIORITY = {
+    "prerequisite": 0,
+    "behavior": 1,
+    "insurance": 2,
+    "price": 3,
+    "experience": 4,
+    "attitude": 5,
+    "channel": 6,
+    "info": 7,
+    "other": 8,
+}
 
 
 @dataclass
@@ -163,49 +176,140 @@ def contains_any(text: str, patterns: Iterable[str]) -> bool:
     return any(pattern in text for pattern in patterns)
 
 
-def find_question(questions: list[Question], patterns: Iterable[str]) -> Question | None:
-    for question in questions:
-        if contains_any(question.text, patterns):
-            return question
-    return None
+def classify_question(question_text: str) -> str:
+    text = question_text.lower()
+    if contains_any(text, ["医保"]):
+        return "insurance"
+    if contains_any(text, ["推荐", "复购", "认可", "是否会向", "是否愿意"]):
+        return "attitude"
+    if contains_any(text, ["症状改善", "疗效", "效果", "满意", "安全", "便利", "依从", "使用"]):
+        if contains_any(text, ["使用"]):
+            return "experience"
+        return "experience"
+    if contains_any(text, ["用药频率", "管理方式", "是否使用", "是否听说", "是否了解"]):
+        return "prerequisite"
+    if contains_any(text, ["价格", "促销"]):
+        return "price"
+    if contains_any(text, ["渠道", "药店", "医院", "电商", "购买"]):
+        return "channel"
+    if contains_any(text, ["信息", "广告", "科普", "来源"]):
+        return "info"
+    return "other"
 
 
-def row_conflicts(row: dict[str, str], questions: list[Question]) -> list[dict[str, str]]:
+def classify_option(option_text: str) -> set[str]:
+    text = option_text.lower()
+    tags: set[str] = set()
+
+    if contains_any(text, ["不确定", "不清楚", "不知道", "无法评价", "无法判断", "一般"]):
+        tags.add("neutral")
+    if contains_any(text, ["未使用", "没使用", "未听说", "不了解", "无相关经历", "不适用", "不用药靠自然缓解"]):
+        tags.add("no_experience")
+    if contains_any(text, ["不用药靠自然缓解", "几乎不用药", "半年1次", "半年 1 次"]):
+        tags.add("low_frequency")
+    if contains_any(text, ["每月至少", "长期", "规律", "定期", "每次都"]):
+        tags.add("high_frequency")
+    if contains_any(text, ["不使用医保", "全额自费"]):
+        tags.add("insurance_not_used")
+    if contains_any(text, ["每次都使用医保", "偶尔使用医保"]):
+        tags.add("insurance_used")
+    if contains_any(text, ["价格非常敏感", "只选低价", "促销活动时才购买"]):
+        tags.add("price_sensitive")
+    if contains_any(text, ["价格不是主要", "只要疗效好", "价格不是"]):
+        tags.add("price_not_sensitive")
+
+    if contains_any(text, ["不会推荐", "几乎没有效果", "无效", "不满意", "不喜欢", "不认可", "不方便", "不好"]):
+        tags.add("negative")
+    if contains_any(text, ["肯定会推荐", "起效快", "明显", "非常满意", "长期规律"]):
+        tags.add("strong_positive")
+        tags.add("positive")
+    elif contains_any(text, ["可能会推荐", "有一定缓解", "缓解", "便利", "方便", "满意", "认可", "合理可接受", "疗效好"]):
+        tags.add("positive")
+
+    if not tags:
+        tags.add("neutral")
+    return tags
+
+
+def question_by_type(questions: list[Question], qtype: str) -> list[Question]:
+    return [question for question in questions if classify_question(question.text) == qtype]
+
+
+def pick_option_by_tags(question: Question, preferred_tags: Iterable[str], fallback_tags: Iterable[str] = ()) -> str:
+    preferred = set(preferred_tags)
+    fallback = set(fallback_tags)
+    for option in question.options:
+        tags = classify_option(option)
+        if preferred & tags:
+            return option
+    for option in question.options:
+        tags = classify_option(option)
+        if fallback & tags:
+            return option
+    return next(iter(question.options))
+
+
+def is_option_allowed(row: dict[str, str], questions: list[Question], question: Question, option: str) -> bool:
+    candidate = dict(row)
+    candidate[question.text] = option
+    return not validate_row(candidate, questions)
+
+
+def validate_row(row: dict[str, str], questions: list[Question]) -> list[dict[str, str]]:
     conflicts: list[dict[str, str]] = []
     q_by_text = {q.text: q for q in questions}
 
     for q_text, answer in row.items():
-        if contains_any(answer, ["不用药", "几乎不用药", "未使用", "不清楚", "不确定"]):
+        q = q_by_text[q_text]
+        qtype = classify_question(q_text)
+        tags = classify_option(answer)
+
+        if tags & {"no_experience"} or (qtype == "prerequisite" and "neutral" in tags):
             for later_text, later_answer in row.items():
                 later_q = q_by_text[later_text]
-                current_q = q_by_text[q_text]
-                if later_q.number <= current_q.number:
+                later_type = classify_question(later_text)
+                later_tags = classify_option(later_answer)
+                if later_q.number <= q.number:
                     continue
-                if contains_any(later_text, USAGE_EVAL_QUESTION_PATTERNS) and contains_any(
-                    later_answer, POSITIVE_OR_EVALUATIVE_PATTERNS
-                ):
+                if later_type in {"experience", "attitude"} and later_tags & {"positive", "strong_positive", "negative"}:
                     conflicts.append(
                         {
-                            "前置题号及选项": f"Q{current_q.number} {answer}",
+                            "前置题号及选项": f"Q{q.number} {answer}",
                             "后续题号及选项": f"Q{later_q.number} {later_answer}",
                             "冲突类型": "前提不成立",
-                            "冲突原因": "前置答案否定或弱化用药前提，后续答案需要明确使用或评价前提。",
+                            "冲突原因": "前置答案否定使用/认知前提，后续答案给出了明确体验或态度评价。",
                             "风险等级": "高",
-                            "修改建议": "该受访者后续使用评价题应改为不确定/无法评价，或前置题改为存在用药行为的选项。",
+                            "修改建议": "保留前提题，后续体验或态度题改为中性/无法评价。",
                         }
                     )
 
-    for q_text, answer in row.items():
-        if "不使用医保" in answer or "全额自费" in answer:
-            for other_text, other_answer in row.items():
-                other_q = q_by_text[other_text]
-                current_q = q_by_text[q_text]
-                if other_text == q_text:
+        if tags & {"low_frequency", "no_experience"}:
+            for later_text, later_answer in row.items():
+                later_q = q_by_text[later_text]
+                later_tags = classify_option(later_answer)
+                if later_q.number <= q.number:
                     continue
-                if "医保报销" in other_text and contains_any(other_answer, ["每次都使用医保", "偶尔使用医保"]):
+                if later_tags & {"high_frequency", "insurance_used"}:
                     conflicts.append(
                         {
-                            "前置题号及选项": f"Q{current_q.number} {answer}",
+                            "前置题号及选项": f"Q{q.number} {answer}",
+                            "后续题号及选项": f"Q{later_q.number} {later_answer}",
+                            "冲突类型": "行为频率冲突",
+                            "冲突原因": "低频/不用药答案不能与长期规律、每次医保等强行为答案共存。",
+                            "风险等级": "高",
+                            "修改建议": "保留前置行为频率，修正后续强行为答案。",
+                        }
+                    )
+
+        if tags & {"insurance_not_used"}:
+            for other_text, other_answer in row.items():
+                other_q = q_by_text[other_text]
+                if other_text == q_text:
+                    continue
+                if classify_option(other_answer) & {"insurance_used"}:
+                    conflicts.append(
+                        {
+                            "前置题号及选项": f"Q{q.number} {answer}",
                             "后续题号及选项": f"Q{other_q.number} {other_answer}",
                             "冲突类型": "医保使用互斥",
                             "冲突原因": "同一受访者不能同时选择不使用医保和使用医保报销。",
@@ -213,7 +317,73 @@ def row_conflicts(row: dict[str, str], questions: list[Question]) -> list[dict[s
                             "修改建议": "保留一种医保使用状态。",
                         }
                     )
+
+        if qtype == "price" and tags & {"price_sensitive"}:
+            for other_text, other_answer in row.items():
+                other_q = q_by_text[other_text]
+                if other_text == q_text:
+                    continue
+                if classify_question(other_text) == "price" and classify_option(other_answer) & {"price_not_sensitive"}:
+                    conflicts.append(
+                        {
+                            "前置题号及选项": f"Q{q.number} {answer}",
+                            "后续题号及选项": f"Q{other_q.number} {other_answer}",
+                            "冲突类型": "价格态度冲突",
+                            "冲突原因": "高价格敏感不能与价格不是主要考虑在同一受访者中共存。",
+                            "风险等级": "中",
+                            "修改建议": "保留一个价格态度，另一个改为中性或同向选项。",
+                        }
+                    )
+
+    experience_states = []
+    attitude_states = []
+    for q_text, answer in row.items():
+        q = q_by_text[q_text]
+        tags = classify_option(answer)
+        qtype = classify_question(q_text)
+        if qtype == "experience":
+            experience_states.append((q, answer, tags))
+        elif qtype == "attitude":
+            attitude_states.append((q, answer, tags))
+
+    has_positive_experience = any(tags & {"positive", "strong_positive"} for _, _, tags in experience_states)
+    has_negative_experience = any("negative" in tags for _, _, tags in experience_states)
+    for att_q, att_answer, att_tags in attitude_states:
+        if has_positive_experience and "negative" in att_tags:
+            source_q, source_answer, _ = next(
+                (item for item in experience_states if item[2] & {"positive", "strong_positive"}),
+                experience_states[0],
+            )
+            conflicts.append(
+                {
+                    "前置题号及选项": f"Q{source_q.number} {source_answer}",
+                    "后续题号及选项": f"Q{att_q.number} {att_answer}",
+                    "冲突类型": "体验与态度极性冲突",
+                    "冲突原因": "正向体验评价不能与负向推荐/复购/认可态度共存。",
+                    "风险等级": "高",
+                    "修改建议": "保留体验评价，修正态度题为可能推荐/肯定推荐/中性。",
+                }
+            )
+        if has_negative_experience and "strong_positive" in att_tags:
+            source_q, source_answer, _ = next(
+                (item for item in experience_states if "negative" in item[2]),
+                experience_states[0],
+            )
+            conflicts.append(
+                {
+                    "前置题号及选项": f"Q{source_q.number} {source_answer}",
+                    "后续题号及选项": f"Q{att_q.number} {att_answer}",
+                    "冲突类型": "负向体验与强正向态度冲突",
+                    "冲突原因": "负向体验评价不能与强推荐/强认可态度共存。",
+                    "风险等级": "高",
+                    "修改建议": "保留体验评价，修正态度题为不推荐或不确定。",
+                }
+            )
     return conflicts
+
+
+def row_conflicts(row: dict[str, str], questions: list[Question]) -> list[dict[str, str]]:
+    return validate_row(row, questions)
 
 
 def safer_option(question: Question) -> str:
@@ -227,10 +397,29 @@ def safer_option(question: Question) -> str:
     return options[0]
 
 
+def context_safe_option(row: dict[str, str], questions: list[Question], question: Question) -> str:
+    qtype = classify_question(question.text)
+    if qtype == "attitude":
+        experiences = [
+            classify_option(answer)
+            for q_text, answer in row.items()
+            if classify_question(q_text) == "experience"
+        ]
+        if any("negative" in tags for tags in experiences):
+            return pick_option_by_tags(question, ["negative", "neutral"])
+        if any(tags & {"positive", "strong_positive"} for tags in experiences):
+            return pick_option_by_tags(question, ["positive", "strong_positive"], ["neutral"])
+    if qtype == "experience":
+        if any(classify_option(answer) & {"no_experience"} for answer in row.values()):
+            return pick_option_by_tags(question, ["neutral"])
+    return safer_option(question)
+
+
 def repair_row(row: dict[str, str], questions: list[Question]) -> dict[str, str]:
     repaired = dict(row)
-    for _ in range(8):
-        conflicts = row_conflicts(repaired, questions)
+    q_by_number = {question.number: question for question in questions}
+    for _ in range(12):
+        conflicts = validate_row(repaired, questions)
         if not conflicts:
             return repaired
         for conflict in conflicts:
@@ -238,20 +427,37 @@ def repair_row(row: dict[str, str], questions: list[Question]) -> dict[str, str]
             if not match:
                 continue
             q_number = int(match.group(1))
-            question = questions[q_number - 1]
-            repaired[question.text] = safer_option(question)
+            question = q_by_number[q_number]
+            repaired[question.text] = context_safe_option(repaired, questions, question)
     return repaired
+
+
+def constrained_weighted_choice(row: dict[str, str], questions: list[Question], question: Question) -> tuple[str, bool]:
+    allowed: OrderedDict[str, int] = OrderedDict()
+    for option, weight in question.options.items():
+        if is_option_allowed(row, questions, question, option):
+            allowed[option] = weight
+    if allowed:
+        return weighted_choice(allowed), False
+    return context_safe_option(row, questions, question), True
 
 
 def generate_answers(questions: list[Question], sample_size: int) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     answers: list[dict[str, str]] = []
     all_conflicts: list[dict[str, str]] = []
+    adjusted_count = 0
+    generation_order = sorted(questions, key=lambda question: (QUESTION_PRIORITY[classify_question(question.text)], question.number))
     for _ in range(sample_size):
-        row = {question.text: weighted_choice(question.options) for question in questions}
+        row: dict[str, str] = {}
+        for question in generation_order:
+            answer, adjusted = constrained_weighted_choice(row, questions, question)
+            adjusted_count += int(adjusted)
+            row[question.text] = answer
         row = repair_row(row, questions)
-        conflicts = row_conflicts(row, questions)
+        conflicts = validate_row(row, questions)
         all_conflicts.extend(conflicts)
         answers.append(row)
+    generate_answers.adjusted_count = adjusted_count
     return answers, all_conflicts
 
 
@@ -325,6 +531,7 @@ def main() -> int:
                 "sample_size": sample_size,
                 "effective_question_count": len(questions),
                 "meta_columns": meta_columns,
+                "adjusted_option_count": getattr(generate_answers, "adjusted_count", 0),
                 "conflict_count_after_generation": len(conflicts),
                 **outputs,
             },
