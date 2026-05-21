@@ -11,10 +11,11 @@ description: Use when checking a Chinese pharmaceutical market research report a
 
 1. 自检「MD/TXT 格式报告」与「问卷内容」的一致性、合理性和逻辑冲突。
 2. 按最小修订原则修改问卷，只处理硬逻辑冲突、明显偏离报告、元信息误判为题目的问题。
-3. 按用户提示词中明确给出的人数生成答案选项表。
-4. 生成时优先避开题目之间的强逻辑冲突，而不是先随机生成再人工校验。
-5. 复检生成后的单人答案，确保不存在硬逻辑冲突。
-6. 最终只输出一张 Excel 表，不单独输出自检报告、逻辑规则表或修订说明表。
+3. 先由大模型基于报告和问卷生成结构化 `constraints.json` 问卷逻辑约束表。
+4. 再由代码读取约束表，按用户提示词中明确给出的人数生成答案选项表。
+5. 生成时优先避开题目之间的强逻辑冲突，而不是先随机生成再人工校验。
+6. 复检生成后的单人答案，确保不存在硬逻辑冲突。
+7. 最终只输出一张 Excel 表，不单独输出自检报告、逻辑规则表或修订说明表。
 
 报告内容不得改写。不得引入报告或问卷没有支撑的新疾病、品种或场景。
 
@@ -40,6 +41,7 @@ description: Use when checking a Chinese pharmaceutical market research report a
 python3 scripts/generate_answer_table.py \
   --questionnaire "/path/to/questionnaire.xlsx" \
   --prompt "用户原始提示词" \
+  --constraints "/path/to/constraints.json" \
   --output-dir "/path/to/output"
 ```
 
@@ -48,8 +50,8 @@ python3 scripts/generate_answer_table.py \
 - 从提示词解析生成人数。
 - 识别并排除元信息列。
 - 从原始明细表归纳题目、选项和选项分布。
-- 将题目识别为前提/行为题、体验评价题、态度结果题、价格/渠道偏好题、信息/认知题。
-- 将选项识别为正向、中性、负向、前提不成立、低频行为、高频行为等语义标签。
+- 优先读取模型生成的 `constraints.json`，其中包含题目角色、选项语义标签和禁止组合规则。
+- 如果没有 `constraints.json`，再回退到内置关键词规则。
 - 生成答案时使用语义约束采样，优先避免强冲突组合。
 - 只生成一张 Excel 宽表：修改后问卷题目作为表头，表体为答案选项。
 - 对每个受访者答案做硬逻辑复检。
@@ -92,7 +94,7 @@ python3 scripts/generate_answer_table.py \
 
 将有效题目列视为问卷题。从每列非空唯一值归纳选项，保留原始选项编号，如 `A.`、`B.`。
 
-## 阶段二：自检
+## 阶段二：自检并生成模型约束表
 
 ### 基础信息抽取
 
@@ -111,6 +113,67 @@ python3 scripts/generate_answer_table.py \
 - 有效题目总数
 
 无法确定时写「未明确」或「输入未提供」。
+
+### 生成 `constraints.json`
+
+在调用脚本前，必须先基于报告、有效题目和选项生成 `constraints.json`。该文件是中间执行文件，不是最终交付物。
+
+Schema：
+
+```json
+{
+  "question_roles": {
+    "Q1": "prerequisite",
+    "Q2": "behavior",
+    "Q9": "experience",
+    "Q11": "attitude"
+  },
+  "option_tags": {
+    "Q9": {
+      "A.起效快，症状缓解明显": ["strong_positive", "positive"],
+      "B.有一定缓解效果": ["positive"],
+      "C.几乎没有效果": ["negative"],
+      "D.不确定": ["neutral"]
+    },
+    "Q11": {
+      "A.肯定会推荐": ["strong_positive", "positive"],
+      "B.可能会推荐": ["positive"],
+      "C.不会推荐": ["negative"],
+      "D.不确定": ["neutral"]
+    }
+  },
+  "rules": [
+    {
+      "id": "R001",
+      "type": "forbid_combination",
+      "type_label": "体验与态度极性冲突",
+      "if": {
+        "question": "Q9",
+        "option_tags_any": ["positive", "strong_positive"]
+      },
+      "then_forbid": {
+        "question": "Q11",
+        "option_tags_any": ["negative"]
+      },
+      "repair": {
+        "target": "then_question",
+        "prefer_tags": ["positive"],
+        "fallback_tags": ["neutral"],
+        "description": "保留体验题，修正推荐题为正向或中性。"
+      },
+      "severity": "high",
+      "reason": "正向体验评价不能与负向推荐态度共存。"
+    }
+  ]
+}
+```
+
+约束表生成规则：
+
+- `question_roles` 必须覆盖所有有效题目，角色限定为：`prerequisite`、`behavior`、`experience`、`attitude`、`price`、`channel`、`info`、`insurance`、`other`。
+- `option_tags` 尽量覆盖所有选项，标签限定为：`positive`、`strong_positive`、`neutral`、`negative`、`no_experience`、`low_frequency`、`high_frequency`、`insurance_used`、`insurance_not_used`、`price_sensitive`、`price_not_sensitive`。
+- `rules` 必须覆盖前提不成立、体验与态度极性、医保互斥、行为频率、价格态度等强冲突。
+- 不确定时保守处理：优先生成 `neutral`，避免强正向或强负向答案组合。
 
 ### 题目与报告内容强关联性检查
 
@@ -168,6 +231,7 @@ python3 scripts/generate_answer_table.py \
 - 使用匿名编号，如 `R001`、`R002`，不得生成真实姓名、手机号、OpenID 等个人隐私。
 - 默认采用原始明细表中每题选项频率作为随机权重。
 - 如果没有原始分布，回退为均匀随机，并在输出中说明。
+- 必须优先执行模型生成的 `constraints.json`；没有约束表时才使用内置规则。
 - 生成顺序应先确定前提/行为题，再生成体验评价题，最后生成推荐/复购/认可等态度结果题。
 - 每道题生成时先根据已生成答案过滤会造成强逻辑冲突的选项；只有无可用选项时才回退到最安全的中性选项。
 - 每生成一行后做单人逻辑复检，发现冲突必须自动修正该行答案，不输出待人工校验的冲突。

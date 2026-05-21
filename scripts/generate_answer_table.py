@@ -22,6 +22,7 @@ from typing import Iterable
 
 from openpyxl import Workbook, load_workbook
 
+CONSTRAINTS: dict = {}
 
 META_COLUMNS = {
     "问卷名称",
@@ -176,7 +177,50 @@ def contains_any(text: str, patterns: Iterable[str]) -> bool:
     return any(pattern in text for pattern in patterns)
 
 
+def question_keys(question: Question | str) -> list[str]:
+    if isinstance(question, Question):
+        return [f"Q{question.number}", f"问题{question.number}", question.text]
+    return [question]
+
+
+def load_constraints(path: Path | None) -> dict:
+    if path is None:
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("constraints must be a JSON object")
+    data.setdefault("question_roles", {})
+    data.setdefault("option_tags", {})
+    data.setdefault("rules", [])
+    return data
+
+
+def constraint_question_role(question: Question | str) -> str | None:
+    roles = CONSTRAINTS.get("question_roles", {})
+    for key in question_keys(question):
+        role = roles.get(key)
+        if role:
+            return str(role)
+    return None
+
+
+def constraint_option_tags(question: Question | str | None, option_text: str) -> set[str]:
+    option_tags = CONSTRAINTS.get("option_tags", {})
+    if question is not None:
+        for key in question_keys(question):
+            tags = option_tags.get(key, {}).get(option_text)
+            if tags:
+                return set(tags)
+    tags = option_tags.get(option_text)
+    if isinstance(tags, list):
+        return set(tags)
+    return set()
+
+
 def classify_question(question_text: str) -> str:
+    role = constraint_question_role(question_text)
+    if role:
+        return role
     text = question_text.lower()
     if contains_any(text, ["医保"]):
         return "insurance"
@@ -197,7 +241,10 @@ def classify_question(question_text: str) -> str:
     return "other"
 
 
-def classify_option(option_text: str) -> set[str]:
+def classify_option(option_text: str, question: Question | str | None = None) -> set[str]:
+    model_tags = constraint_option_tags(question, option_text)
+    if model_tags:
+        return model_tags
     text = option_text.lower()
     tags: set[str] = set()
 
@@ -239,11 +286,11 @@ def pick_option_by_tags(question: Question, preferred_tags: Iterable[str], fallb
     preferred = set(preferred_tags)
     fallback = set(fallback_tags)
     for option in question.options:
-        tags = classify_option(option)
+        tags = classify_option(option, question)
         if preferred & tags:
             return option
     for option in question.options:
-        tags = classify_option(option)
+        tags = classify_option(option, question)
         if fallback & tags:
             return option
     return next(iter(question.options))
@@ -255,20 +302,82 @@ def is_option_allowed(row: dict[str, str], questions: list[Question], question: 
     return not validate_row(candidate, questions)
 
 
-def validate_row(row: dict[str, str], questions: list[Question]) -> list[dict[str, str]]:
+def question_matches(rule_question: str | None, question: Question) -> bool:
+    if not rule_question:
+        return False
+    return rule_question in question_keys(question) or rule_question == question.text
+
+
+def resolve_rule_questions(rule_part: dict, questions: list[Question]) -> list[Question]:
+    if not isinstance(rule_part, dict):
+        return []
+    raw_question = rule_part.get("question")
+    raw_role = rule_part.get("question_role")
+    matches: list[Question] = []
+    for question in questions:
+        if raw_question and question_matches(str(raw_question), question):
+            matches.append(question)
+        elif raw_role and classify_question(question.text) == raw_role:
+            matches.append(question)
+    return matches
+
+
+def tags_match(tags: set[str], rule_part: dict) -> bool:
+    any_tags = set(rule_part.get("option_tags_any", []) or [])
+    all_tags = set(rule_part.get("option_tags_all", []) or [])
+    if any_tags and not (tags & any_tags):
+        return False
+    if all_tags and not all_tags.issubset(tags):
+        return False
+    return bool(any_tags or all_tags)
+
+
+def model_rule_conflicts(row: dict[str, str], questions: list[Question]) -> list[dict[str, str]]:
     conflicts: list[dict[str, str]] = []
+    q_by_text = {question.text: question for question in questions}
+    for rule in CONSTRAINTS.get("rules", []):
+        if not isinstance(rule, dict) or rule.get("type", "forbid_combination") != "forbid_combination":
+            continue
+        if_part = rule.get("if", {})
+        forbid_part = rule.get("then_forbid", {})
+        if_questions = resolve_rule_questions(if_part, questions)
+        forbid_questions = resolve_rule_questions(forbid_part, questions)
+        for if_q in if_questions:
+            if_answer = row.get(if_q.text)
+            if not if_answer or not tags_match(classify_option(if_answer, if_q), if_part):
+                continue
+            for forbid_q in forbid_questions:
+                forbid_answer = row.get(forbid_q.text)
+                if not forbid_answer or not tags_match(classify_option(forbid_answer, forbid_q), forbid_part):
+                    continue
+                conflicts.append(
+                    {
+                        "前置题号及选项": f"Q{if_q.number} {if_answer}",
+                        "后续题号及选项": f"Q{forbid_q.number} {forbid_answer}",
+                        "冲突类型": rule.get("type_label", "模型约束冲突"),
+                        "冲突原因": rule.get("reason", "模型生成的逻辑约束禁止该答案组合。"),
+                        "风险等级": rule.get("severity", "high"),
+                        "修改建议": rule.get("repair", {}).get("description", "按约束表修正目标题选项。"),
+                        "rule": rule,
+                    }
+                )
+    return conflicts
+
+
+def validate_row(row: dict[str, str], questions: list[Question]) -> list[dict[str, str]]:
+    conflicts: list[dict[str, str]] = model_rule_conflicts(row, questions)
     q_by_text = {q.text: q for q in questions}
 
     for q_text, answer in row.items():
         q = q_by_text[q_text]
         qtype = classify_question(q_text)
-        tags = classify_option(answer)
+        tags = classify_option(answer, q)
 
         if tags & {"no_experience"} or (qtype == "prerequisite" and "neutral" in tags):
             for later_text, later_answer in row.items():
                 later_q = q_by_text[later_text]
                 later_type = classify_question(later_text)
-                later_tags = classify_option(later_answer)
+                later_tags = classify_option(later_answer, later_q)
                 if later_q.number <= q.number:
                     continue
                 if later_type in {"experience", "attitude"} and later_tags & {"positive", "strong_positive", "negative"}:
@@ -286,7 +395,7 @@ def validate_row(row: dict[str, str], questions: list[Question]) -> list[dict[st
         if tags & {"low_frequency", "no_experience"}:
             for later_text, later_answer in row.items():
                 later_q = q_by_text[later_text]
-                later_tags = classify_option(later_answer)
+                later_tags = classify_option(later_answer, later_q)
                 if later_q.number <= q.number:
                     continue
                 if later_tags & {"high_frequency", "insurance_used"}:
@@ -306,7 +415,7 @@ def validate_row(row: dict[str, str], questions: list[Question]) -> list[dict[st
                 other_q = q_by_text[other_text]
                 if other_text == q_text:
                     continue
-                if classify_option(other_answer) & {"insurance_used"}:
+                if classify_option(other_answer, other_q) & {"insurance_used"}:
                     conflicts.append(
                         {
                             "前置题号及选项": f"Q{q.number} {answer}",
@@ -323,7 +432,7 @@ def validate_row(row: dict[str, str], questions: list[Question]) -> list[dict[st
                 other_q = q_by_text[other_text]
                 if other_text == q_text:
                     continue
-                if classify_question(other_text) == "price" and classify_option(other_answer) & {"price_not_sensitive"}:
+                if classify_question(other_text) == "price" and classify_option(other_answer, other_q) & {"price_not_sensitive"}:
                     conflicts.append(
                         {
                             "前置题号及选项": f"Q{q.number} {answer}",
@@ -339,7 +448,7 @@ def validate_row(row: dict[str, str], questions: list[Question]) -> list[dict[st
     attitude_states = []
     for q_text, answer in row.items():
         q = q_by_text[q_text]
-        tags = classify_option(answer)
+        tags = classify_option(answer, q)
         qtype = classify_question(q_text)
         if qtype == "experience":
             experience_states.append((q, answer, tags))
@@ -389,19 +498,31 @@ def row_conflicts(row: dict[str, str], questions: list[Question]) -> list[dict[s
 def safer_option(question: Question) -> str:
     options = list(question.options.keys())
     for option in options:
-        if contains_any(option, ["不确定", "无法评价", "不清楚"]):
+        if classify_option(option, question) & {"neutral"} or contains_any(option, ["不确定", "无法评价", "不清楚"]):
             return option
     for option in options:
-        if not contains_any(option, POSITIVE_OR_EVALUATIVE_PATTERNS):
+        tags = classify_option(option, question)
+        if not (tags & {"positive", "strong_positive"}):
             return option
     return options[0]
 
 
 def context_safe_option(row: dict[str, str], questions: list[Question], question: Question) -> str:
+    rule_conflicts = [conflict for conflict in validate_row(row, questions) if "rule" in conflict]
+    for conflict in rule_conflicts:
+        match = re.match(r"Q(\d+)\s", conflict["后续题号及选项"])
+        if not match or int(match.group(1)) != question.number:
+            continue
+        repair = conflict["rule"].get("repair", {})
+        preferred = repair.get("prefer_tags", [])
+        fallback = repair.get("fallback_tags", ["neutral"])
+        if preferred or fallback:
+            return pick_option_by_tags(question, preferred, fallback)
+
     qtype = classify_question(question.text)
     if qtype == "attitude":
         experiences = [
-            classify_option(answer)
+            classify_option(answer, q_text)
             for q_text, answer in row.items()
             if classify_question(q_text) == "experience"
         ]
@@ -499,14 +620,17 @@ def write_outputs(
 
 
 def main() -> int:
+    global CONSTRAINTS
     parser = argparse.ArgumentParser()
     parser.add_argument("--questionnaire", required=True, type=Path)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--constraints", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=20240521)
     args = parser.parse_args()
 
     random.seed(args.seed)
+    CONSTRAINTS = load_constraints(args.constraints)
     sample_size = parse_sample_size(args.prompt)
     meta_columns, questions, meta_values = read_questions(args.questionnaire)
     answers: list[dict[str, str]] = []
@@ -531,6 +655,8 @@ def main() -> int:
                 "sample_size": sample_size,
                 "effective_question_count": len(questions),
                 "meta_columns": meta_columns,
+                "constraint_source": "model_generated" if CONSTRAINTS else "builtin",
+                "constraint_rule_count": len(CONSTRAINTS.get("rules", [])) if CONSTRAINTS else 0,
                 "adjusted_option_count": getattr(generate_answers, "adjusted_count", 0),
                 "conflict_count_after_generation": len(conflicts),
                 **outputs,
