@@ -1,0 +1,7 @@
+interface:
+  display_name: "医药问卷自检"
+  short_description: "自检修订问卷并生成无冲突答案表"
+  default_prompt: "Use $medical-survey-report-self-check to inspect a medical research report and questionnaire, minimally revise the questionnaire, and generate an answer option table for the sample size stated in my prompt."
+
+policy:
+  allow_implicit_invocation: true
