@@ -1,0 +1,14 @@
+[Unit]
+Description=Survey Self-Check Skill API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/survey-skill
+EnvironmentFile=/opt/survey-skill/.env
+ExecStart=/opt/survey-skill/.venv/bin/uvicorn server.app:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
