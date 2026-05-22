@@ -172,6 +172,7 @@ Schema：
 
 - `question_roles` 必须覆盖所有有效题目，角色限定为：`prerequisite`、`behavior`、`experience`、`attitude`、`price`、`channel`、`info`、`insurance`、`other`。
 - `option_tags` 尽量覆盖所有选项，标签限定为：`positive`、`strong_positive`、`neutral`、`negative`、`no_experience`、`low_frequency`、`high_frequency`、`insurance_used`、`insurance_not_used`、`price_sensitive`、`price_not_sensitive`。
+- `不确定 / 不知道 / 不清楚 / 无法评价 / 无法判断 / 其他 / 其他品牌 / 其他原因 / 其他渠道` 等模糊选项必须增加 `fuzzy` 标签。
 - `rules` 必须覆盖前提不成立、体验与态度极性、医保互斥、行为频率、价格态度等强冲突。
 - 不确定时保守处理：优先生成 `neutral`，避免强正向或强负向答案组合。
 
@@ -232,6 +233,10 @@ Schema：
 - 默认采用原始明细表中每题选项频率作为随机权重。
 - 如果没有原始分布，回退为均匀随机，并在输出中说明。
 - 必须优先执行模型生成的 `constraints.json`；没有约束表时才使用内置规则。
+- 模糊回答按整张答案表总口径控制：`模糊回答总数 / (生成人数 × 有效题目数) <= 20%`。
+- `问卷日期 / 手机版本 / OpenID` 不计入模糊比例分母。
+- 模糊比例控制优先级高于保留原始分布，但低于硬逻辑无冲突。
+- 模糊回答包括 `不确定 / 不知道 / 不清楚 / 无法评价 / 无法判断 / 其他` 以及包含“其他”的选项。
 - 生成顺序应先确定前提/行为题，再生成体验评价题，最后生成推荐/复购/认可等态度结果题。
 - 每道题生成时先根据已生成答案过滤会造成强逻辑冲突的选项；只有无可用选项时才回退到最安全的中性选项。
 - 每生成一行后做单人逻辑复检，发现冲突必须自动修正该行答案，不输出待人工校验的冲突。

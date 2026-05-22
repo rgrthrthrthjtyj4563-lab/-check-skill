@@ -93,6 +93,7 @@ async def generate_constraints(report_text: str, questions: list[dict]) -> dict:
 5. 角色限定：prerequisite, behavior, experience, attitude, price, channel, info, insurance, other。
 6. 标签限定：positive, strong_positive, neutral, negative, no_experience, low_frequency, high_frequency, insurance_used, insurance_not_used, price_sensitive, price_not_sensitive。
 7. 必须覆盖：未使用/未听说/不确定前提与后续评价冲突、正向体验与负向推荐冲突、负向体验与强正向推荐冲突、医保互斥、低频/不用药与强行为冲突、价格态度冲突。
+8. 对“不确定、不知道、不清楚、无法评价、无法判断、其他”等模糊选项必须增加 fuzzy 标签。
 
 输出 JSON schema 示例：
 {json.dumps(schema, ensure_ascii=False)}
@@ -144,9 +145,12 @@ async def generate(
     report: UploadFile = File(...),
     questionnaire: UploadFile = File(...),
     sample_size: int = Form(...),
+    max_fuzzy_rate: float = Form(0.2),
 ):
     if sample_size <= 0:
         raise HTTPException(status_code=400, detail="sample_size must be positive")
+    if not 0 <= max_fuzzy_rate <= 1:
+        raise HTTPException(status_code=400, detail="max_fuzzy_rate must be between 0 and 1")
 
     workdir = Path(tempfile.mkdtemp(prefix="survey_skill_"))
     report_path = workdir / (report.filename or "report.txt")
@@ -172,6 +176,8 @@ async def generate(
             f"请生成{sample_size}人答案选项表",
             "--constraints",
             str(constraints_path),
+            "--max-fuzzy-rate",
+            str(max_fuzzy_rate),
             "--output-dir",
             str(output_dir),
         ],

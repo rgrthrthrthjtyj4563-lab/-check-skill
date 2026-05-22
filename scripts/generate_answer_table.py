@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import re
 from collections import OrderedDict
@@ -243,13 +244,13 @@ def classify_question(question_text: str) -> str:
 
 def classify_option(option_text: str, question: Question | str | None = None) -> set[str]:
     model_tags = constraint_option_tags(question, option_text)
-    if model_tags:
-        return model_tags
     text = option_text.lower()
-    tags: set[str] = set()
+    tags: set[str] = set(model_tags)
 
     if contains_any(text, ["不确定", "不清楚", "不知道", "无法评价", "无法判断", "一般"]):
         tags.add("neutral")
+    if contains_any(text, ["不确定", "不清楚", "不知道", "无法评价", "无法判断", "其他"]):
+        tags.add("fuzzy")
     if contains_any(text, ["未使用", "没使用", "未听说", "不了解", "无相关经历", "不适用", "不用药靠自然缓解"]):
         tags.add("no_experience")
     if contains_any(text, ["不用药靠自然缓解", "几乎不用药", "半年1次", "半年 1 次"]):
@@ -294,6 +295,10 @@ def pick_option_by_tags(question: Question, preferred_tags: Iterable[str], fallb
         if fallback & tags:
             return option
     return next(iter(question.options))
+
+
+def is_fuzzy_option(option_text: str, question: Question | str | None = None) -> bool:
+    return "fuzzy" in classify_option(option_text, question)
 
 
 def is_option_allowed(row: dict[str, str], questions: list[Question], question: Question, option: str) -> bool:
@@ -495,8 +500,20 @@ def row_conflicts(row: dict[str, str], questions: list[Question]) -> list[dict[s
     return validate_row(row, questions)
 
 
-def safer_option(question: Question) -> str:
+def safer_option(question: Question, avoid_fuzzy: bool = False) -> str:
     options = list(question.options.keys())
+    if avoid_fuzzy:
+        for option in options:
+            tags = classify_option(option, question)
+            if "fuzzy" not in tags and "neutral" in tags:
+                return option
+        for option in options:
+            tags = classify_option(option, question)
+            if "fuzzy" not in tags and not (tags & {"positive", "strong_positive"}):
+                return option
+        for option in options:
+            if not is_fuzzy_option(option, question):
+                return option
     for option in options:
         if classify_option(option, question) & {"neutral"} or contains_any(option, ["不确定", "无法评价", "不清楚"]):
             return option
@@ -507,7 +524,72 @@ def safer_option(question: Question) -> str:
     return options[0]
 
 
-def context_safe_option(row: dict[str, str], questions: list[Question], question: Question) -> str:
+def pick_non_fuzzy_by_tags(question: Question, preferred_tags: Iterable[str], fallback_tags: Iterable[str] = ()) -> str | None:
+    preferred = set(preferred_tags)
+    fallback = set(fallback_tags)
+    for option in question.options:
+        tags = classify_option(option, question)
+        if "fuzzy" not in tags and preferred & tags:
+            return option
+    for option in question.options:
+        tags = classify_option(option, question)
+        if "fuzzy" not in tags and fallback & tags:
+            return option
+    for option in question.options:
+        if not is_fuzzy_option(option, question):
+            return option
+    return None
+
+
+def candidate_options_by_tags(
+    question: Question,
+    preferred_tags: Iterable[str],
+    fallback_tags: Iterable[str] = (),
+) -> list[str]:
+    preferred = set(preferred_tags)
+    fallback = set(fallback_tags)
+    options: list[str] = []
+    for option in question.options:
+        tags = classify_option(option, question)
+        if preferred & tags:
+            options.append(option)
+    for option in question.options:
+        tags = classify_option(option, question)
+        if fallback & tags and option not in options:
+            options.append(option)
+    for option in question.options:
+        if option not in options:
+            options.append(option)
+    return options
+
+
+def choose_valid_option(
+    row: dict[str, str],
+    questions: list[Question],
+    question: Question,
+    preferred_tags: Iterable[str],
+    fallback_tags: Iterable[str] = (),
+    avoid_fuzzy: bool = False,
+) -> str | None:
+    candidates = candidate_options_by_tags(question, preferred_tags, fallback_tags)
+    if avoid_fuzzy:
+        non_fuzzy = [option for option in candidates if not is_fuzzy_option(option, question)]
+        fuzzy = [option for option in candidates if is_fuzzy_option(option, question)]
+        candidates = non_fuzzy + fuzzy
+    for option in candidates:
+        candidate_row = dict(row)
+        candidate_row[question.text] = option
+        if not validate_row(candidate_row, questions):
+            return option
+    return None
+
+
+def context_safe_option(
+    row: dict[str, str],
+    questions: list[Question],
+    question: Question,
+    avoid_fuzzy: bool = False,
+) -> str:
     rule_conflicts = [conflict for conflict in validate_row(row, questions) if "rule" in conflict]
     for conflict in rule_conflicts:
         match = re.match(r"Q(\d+)\s", conflict["后续题号及选项"])
@@ -517,6 +599,9 @@ def context_safe_option(row: dict[str, str], questions: list[Question], question
         preferred = repair.get("prefer_tags", [])
         fallback = repair.get("fallback_tags", ["neutral"])
         if preferred or fallback:
+            valid = choose_valid_option(replace_question_with_blank(row, question), questions, question, preferred, fallback, avoid_fuzzy)
+            if valid:
+                return valid
             return pick_option_by_tags(question, preferred, fallback)
 
     qtype = classify_question(question.text)
@@ -527,16 +612,34 @@ def context_safe_option(row: dict[str, str], questions: list[Question], question
             if classify_question(q_text) == "experience"
         ]
         if any("negative" in tags for tags in experiences):
+            valid = choose_valid_option(replace_question_with_blank(row, question), questions, question, ["negative", "neutral"], avoid_fuzzy=avoid_fuzzy)
+            if valid:
+                return valid
             return pick_option_by_tags(question, ["negative", "neutral"])
         if any(tags & {"positive", "strong_positive"} for tags in experiences):
+            valid = choose_valid_option(replace_question_with_blank(row, question), questions, question, ["positive", "strong_positive"], ["neutral"], avoid_fuzzy)
+            if valid:
+                return valid
             return pick_option_by_tags(question, ["positive", "strong_positive"], ["neutral"])
     if qtype == "experience":
         if any(classify_option(answer) & {"no_experience"} for answer in row.values()):
+            valid = choose_valid_option(replace_question_with_blank(row, question), questions, question, ["neutral"], avoid_fuzzy=avoid_fuzzy)
+            if valid:
+                return valid
             return pick_option_by_tags(question, ["neutral"])
-    return safer_option(question)
+    valid = choose_valid_option(replace_question_with_blank(row, question), questions, question, ["neutral"], avoid_fuzzy=avoid_fuzzy)
+    if valid:
+        return valid
+    return safer_option(question, avoid_fuzzy=avoid_fuzzy)
 
 
-def repair_row(row: dict[str, str], questions: list[Question]) -> dict[str, str]:
+def replace_question_with_blank(row: dict[str, str], question: Question) -> dict[str, str]:
+    candidate = dict(row)
+    candidate.pop(question.text, None)
+    return candidate
+
+
+def repair_row(row: dict[str, str], questions: list[Question], avoid_fuzzy: bool = False) -> dict[str, str]:
     repaired = dict(row)
     q_by_number = {question.number: question for question in questions}
     for _ in range(12):
@@ -549,37 +652,134 @@ def repair_row(row: dict[str, str], questions: list[Question]) -> dict[str, str]
                 continue
             q_number = int(match.group(1))
             question = q_by_number[q_number]
-            repaired[question.text] = context_safe_option(repaired, questions, question)
+            repaired[question.text] = context_safe_option(repaired, questions, question, avoid_fuzzy=avoid_fuzzy)
     return repaired
 
 
-def constrained_weighted_choice(row: dict[str, str], questions: list[Question], question: Question) -> tuple[str, bool]:
+def constrained_weighted_choice(
+    row: dict[str, str],
+    questions: list[Question],
+    question: Question,
+    avoid_fuzzy: bool = False,
+) -> tuple[str, bool]:
     allowed: OrderedDict[str, int] = OrderedDict()
     for option, weight in question.options.items():
+        if avoid_fuzzy and is_fuzzy_option(option, question):
+            continue
         if is_option_allowed(row, questions, question, option):
             allowed[option] = weight
     if allowed:
         return weighted_choice(allowed), False
-    return context_safe_option(row, questions, question), True
+    return context_safe_option(row, questions, question, avoid_fuzzy=avoid_fuzzy), True
 
 
-def generate_answers(questions: list[Question], sample_size: int) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+def fuzzy_count_for_rows(rows: list[dict[str, str]], questions: list[Question]) -> int:
+    return sum(
+        1
+        for row in rows
+        for question in questions
+        if is_fuzzy_option(row.get(question.text, ""), question)
+    )
+
+
+def generate_answers(
+    questions: list[Question],
+    sample_size: int,
+    max_fuzzy_rate: float,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     answers: list[dict[str, str]] = []
     all_conflicts: list[dict[str, str]] = []
     adjusted_count = 0
+    fuzzy_total = 0
+    fuzzy_limit = math.floor(sample_size * len(questions) * max_fuzzy_rate)
     generation_order = sorted(questions, key=lambda question: (QUESTION_PRIORITY[classify_question(question.text)], question.number))
     for _ in range(sample_size):
         row: dict[str, str] = {}
         for question in generation_order:
-            answer, adjusted = constrained_weighted_choice(row, questions, question)
+            avoid_fuzzy = fuzzy_total >= fuzzy_limit
+            answer, adjusted = constrained_weighted_choice(row, questions, question, avoid_fuzzy=avoid_fuzzy)
             adjusted_count += int(adjusted)
             row[question.text] = answer
-        row = repair_row(row, questions)
+            fuzzy_total += int(is_fuzzy_option(answer, question))
+        before_repair_fuzzy = sum(is_fuzzy_option(row.get(question.text, ""), question) for question in questions)
+        row = repair_row(row, questions, avoid_fuzzy=fuzzy_total >= fuzzy_limit)
+        if validate_row(row, questions):
+            # Hard logic wins over fuzzy-rate control.
+            row = repair_row(row, questions, avoid_fuzzy=False)
+        after_repair_fuzzy = sum(is_fuzzy_option(row.get(question.text, ""), question) for question in questions)
+        fuzzy_total += after_repair_fuzzy - before_repair_fuzzy
         conflicts = validate_row(row, questions)
         all_conflicts.extend(conflicts)
         answers.append(row)
+    answers = reduce_fuzzy_answers(answers, questions, fuzzy_limit)
+    all_conflicts = [conflict for row in answers for conflict in validate_row(row, questions)]
     generate_answers.adjusted_count = adjusted_count
+    generate_answers.fuzzy_total = fuzzy_count_for_rows(answers, questions)
+    generate_answers.fuzzy_limit = fuzzy_limit
+    generate_answers.max_fuzzy_rate = max_fuzzy_rate
     return answers, all_conflicts
+
+
+def reduce_fuzzy_answers(
+    answers: list[dict[str, str]],
+    questions: list[Question],
+    fuzzy_limit: int,
+) -> list[dict[str, str]]:
+    fuzzy_total = fuzzy_count_for_rows(answers, questions)
+    if fuzzy_total <= fuzzy_limit:
+        return answers
+
+    for row in answers:
+        if fuzzy_total <= fuzzy_limit:
+            break
+        for question in questions:
+            current = row.get(question.text, "")
+            if not is_fuzzy_option(current, question):
+                continue
+            replacement = choose_valid_option(
+                replace_question_with_blank(row, question),
+                questions,
+                question,
+                ["positive", "negative", "price_sensitive", "price_not_sensitive", "insurance_used", "insurance_not_used", "high_frequency", "low_frequency"],
+                ["neutral"],
+                avoid_fuzzy=True,
+            )
+            if replacement and not is_fuzzy_option(replacement, question):
+                row[question.text] = replacement
+                fuzzy_total -= 1
+                if fuzzy_total <= fuzzy_limit:
+                    break
+                continue
+            replacement = replace_upstream_to_reduce_fuzzy(row, questions, question)
+            if replacement:
+                row.update(replacement)
+                fuzzy_total = fuzzy_count_for_rows(answers, questions)
+                if fuzzy_total <= fuzzy_limit:
+                    break
+    return answers
+
+
+def replace_upstream_to_reduce_fuzzy(
+    row: dict[str, str],
+    questions: list[Question],
+    fuzzy_question: Question,
+) -> dict[str, str] | None:
+    for upstream in questions:
+        if upstream.number >= fuzzy_question.number:
+            continue
+        for upstream_option in upstream.options:
+            if is_fuzzy_option(upstream_option, upstream):
+                continue
+            trial_base = dict(row)
+            trial_base[upstream.text] = upstream_option
+            for target_option in fuzzy_question.options:
+                if is_fuzzy_option(target_option, fuzzy_question):
+                    continue
+                trial = dict(trial_base)
+                trial[fuzzy_question.text] = target_option
+                if not validate_row(trial, questions):
+                    return {upstream.text: upstream_option, fuzzy_question.text: target_option}
+    return None
 
 
 def write_outputs(
@@ -626,6 +826,7 @@ def main() -> int:
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--constraints", type=Path, default=None)
+    parser.add_argument("--max-fuzzy-rate", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=20240521)
     args = parser.parse_args()
 
@@ -636,7 +837,7 @@ def main() -> int:
     answers: list[dict[str, str]] = []
     conflicts: list[dict[str, str]] = []
     if sample_size is not None:
-        answers, conflicts = generate_answers(questions, sample_size)
+        answers, conflicts = generate_answers(questions, sample_size, args.max_fuzzy_rate)
 
     outputs = write_outputs(
         args.output_dir,
@@ -658,6 +859,19 @@ def main() -> int:
                 "constraint_source": "model_generated" if CONSTRAINTS else "builtin",
                 "constraint_rule_count": len(CONSTRAINTS.get("rules", [])) if CONSTRAINTS else 0,
                 "adjusted_option_count": getattr(generate_answers, "adjusted_count", 0),
+                "max_fuzzy_rate": args.max_fuzzy_rate,
+                "fuzzy_total": getattr(generate_answers, "fuzzy_total", 0),
+                "fuzzy_limit": getattr(generate_answers, "fuzzy_limit", 0),
+                "fuzzy_rate": (
+                    getattr(generate_answers, "fuzzy_total", 0) / (sample_size * len(questions))
+                    if sample_size and questions
+                    else 0
+                ),
+                "fuzzy_rate_violation": (
+                    getattr(generate_answers, "fuzzy_total", 0) > getattr(generate_answers, "fuzzy_limit", 0)
+                    if sample_size and questions
+                    else False
+                ),
                 "conflict_count_after_generation": len(conflicts),
                 **outputs,
             },
